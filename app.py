@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="隔夜战法", layout="wide")
 
+BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+
 # ── Hide Streamlit chrome ──
 st.markdown(
     """<style>
@@ -35,14 +37,13 @@ st.title("📈 隔夜战法选股")
 
 
 # ═══════════════════════════════════════════════════════════
-#  时间锁 ── 仅允许尾盘 14:30 ~ 14:55 操作
+#  时间模式 ── 实时模式（14:30-14:55）/ 复盘模式
 # ═══════════════════════════════════════════════════════════
 
 START_HOUR, START_MIN = 14, 30
 END_HOUR, END_MIN = 14, 55
 
-beijing_tz = pytz.timezone("Asia/Shanghai")
-now_bj = datetime.now(beijing_tz)
+now_bj = datetime.now(BEIJING_TZ)
 current_code = now_bj.hour * 100 + now_bj.minute
 start_code = START_HOUR * 100 + START_MIN
 end_code = END_HOUR * 100 + END_MIN
@@ -50,17 +51,16 @@ end_code = END_HOUR * 100 + END_MIN
 is_in_window = start_code <= current_code < end_code
 
 if is_in_window:
-    st.success(
-        f"✅ 当前有效选股时段（{START_HOUR:02d}:{START_MIN:02d}-"
-        f"{END_HOUR:02d}:{END_MIN:02d}），点击按钮开始筛选 "
-        f"🕐 服务器时间 {now_bj.strftime('%H:%M:%S')}"
-    )
+    mode_label = "🟢 实时模式"
+    mode_desc = "基于今日盘中数据选股"
 else:
-    st.warning(
-        f"⚠️ 当前非尾盘有效时段（{START_HOUR:02d}:{START_MIN:02d}-"
-        f"{END_HOUR:02d}:{END_MIN:02d}），数据无效，请勿操作！ "
-        f"🕐 服务器时间 {now_bj.strftime('%H:%M:%S')}"
-    )
+    mode_label = "🔵 复盘模式"
+    mode_desc = "基于最近交易日收盘数据选股"
+
+st.info(
+    f"{mode_label}：{mode_desc}　"
+    f"🕐 {now_bj.strftime('%H:%M:%S')}"
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -104,14 +104,33 @@ def get_stock_names():
 
 @st.cache_data(ttl=300)
 def get_latest_trade_date():
-    """获取最近一个交易日（YYYYMMDD）"""
-    today = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+    """获取最近一个交易日（UTC+8）"""
+    now_bj = datetime.now(BEIJING_TZ)
+    today = now_bj.strftime("%Y%m%d")
+    start = (now_bj - timedelta(days=15)).strftime("%Y%m%d")
     try:
         cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=today)
         if cal is None or cal.empty:
             return None
         trade_dates = cal[cal["is_open"] == 1]["cal_date"].tolist()
+        return trade_dates[-1] if trade_dates else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300)
+def get_prev_trade_date():
+    """获取上一个交易日（相对今天）"""
+    now_bj = datetime.now(BEIJING_TZ)
+    today = now_bj.strftime("%Y%m%d")
+    start = (now_bj - timedelta(days=15)).strftime("%Y%m%d")
+    try:
+        cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=today)
+        if cal is None or cal.empty:
+            return None
+        trade_dates = cal[cal["is_open"] == 1]["cal_date"].tolist()
+        if len(trade_dates) >= 2:
+            return trade_dates[-2]
         return trade_dates[-1] if trade_dates else None
     except Exception:
         return None
@@ -160,38 +179,26 @@ def get_hist_bars(ts_code, start, end):
 
 
 # ═══════════════════════════════════════════════════════════
-#  主流程
+#  选股结果缓存（按模式分立TTL）
 # ═══════════════════════════════════════════════════════════
 
-if st.button("🚀 一键选股", type="primary", use_container_width=True, disabled=not is_in_window):
-    bar = st.progress(0, "正在获取交易日信息…")
+def _screening_pipeline(trade_date):
+    """核心选股流水线（不含 Streamlit UI），供缓存包装器调用"""
+    now_bj = datetime.now(BEIJING_TZ)
+    today_str = now_bj.strftime("%Y%m%d")
+    start_hist = (now_bj - timedelta(days=120)).strftime("%Y%m%d")
 
-    # ── 确定交易日 ──
-    trade_date = get_latest_trade_date()
-    if trade_date is None:
-        bar.empty()
-        st.error("❌ 无法获取交易日信息，请检查网络或 Tushare 积分")
-        st.stop()
-
-    # ── 获取股票列表（用于名称过滤） ──
-    bar.progress(12, "正在获取股票列表…")
+    # ── 获取股票名称列表 ──
     stock_df = get_stock_names()
     if stock_df.empty:
-        bar.empty()
-        st.error("❌ 获取股票列表失败，请检查 Tushare 积分是否充足")
-        st.stop()
+        return []
 
-    # ── 获取当日全市场行情 ──
-    bar.progress(22, f"正在获取 {trade_date} 行情数据…")
+    # ── 获取指定交易日全市场行情 ──
     market_df = get_today_data(trade_date)
     if market_df.empty:
-        bar.empty()
-        st.error("❌ 今日非交易日或数据为空，请确认")
-        st.stop()
+        return []
 
     # ── Step 1：实时数据初筛 ──
-    bar.progress(32, "正在初筛股票…")
-
     df = market_df.merge(stock_df[["ts_code", "name"]], on="ts_code", how="left")
 
     # 剔除 ST / *ST / 退
@@ -211,25 +218,14 @@ if st.button("🚀 一键选股", type="primary", use_container_width=True, disa
     screened = df[mask].copy()
 
     if screened.empty:
-        bar.empty()
-        st.info("📭 今日无符合条件标的，建议空仓休息 ☕")
-        st.stop()
-
-    bar.progress(38, f"初筛通过 {len(screened)} 只，深度分析 K 线…")
+        return []
 
     # ── Step 2：历史 K 线深度确认 ──
-    today_str = datetime.now().strftime("%Y%m%d")
-    start_hist = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
-
     results = []
-    n = len(screened)
-
-    for idx, (_, row) in enumerate(screened.iterrows()):
+    for _, row in screened.iterrows():
         ts_code = row["ts_code"]
         name = row["name"]
         code_short = ts_code[:6]
-        pct = 38 + int(58 * (idx + 1) / n)
-        bar.progress(min(pct, 97), f"分析 {name}({code_short})  [{idx + 1}/{n}]")
 
         try:
             hist = get_hist_bars(ts_code, start_hist, today_str)
@@ -280,11 +276,71 @@ if st.button("🚀 一键选股", type="primary", use_container_width=True, disa
 
         time.sleep(0.3)
 
-    # ── 渲染结果 ──
-    bar.progress(99, "渲染结果…")
+    return results
+
+
+@st.cache_data(ttl=60)
+def screening_realtime(trade_date):
+    """实时模式缓存（60秒）"""
+    now_bj = datetime.now(BEIJING_TZ)
+    results = _screening_pipeline(trade_date)
+    return results, now_bj
+
+
+@st.cache_data(ttl=86400)
+def screening_review(trade_date):
+    """复盘模式缓存（24小时）"""
+    now_bj = datetime.now(BEIJING_TZ)
+    results = _screening_pipeline(trade_date)
+    return results, now_bj
+
+
+# ═══════════════════════════════════════════════════════════
+#  主流程（按钮始终可用）
+# ═══════════════════════════════════════════════════════════
+
+if st.button("🚀 一键选股", type="primary", use_container_width=True):
+    bar = st.progress(0, "正在获取交易日信息…")
+
+    # ── 确定交易日 ──
+    trade_date = get_latest_trade_date()
+    if trade_date is None:
+        bar.empty()
+        st.error("❌ 无法获取交易日信息，请检查网络或 Tushare 积分")
+        st.stop()
+
+    today_str = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
+    now_hour = datetime.now(BEIJING_TZ).hour
+
+    # ── 根据模式选择数据日期 ──
+    if is_in_window:
+        # 实时模式：使用当天盘中数据
+        pass
+    else:
+        # 复盘模式：使用最近一个完整交易日
+        if trade_date == today_str and now_hour < 15:
+            prev = get_prev_trade_date()
+            if prev:
+                trade_date = prev
+
+    # ── 调用缓存选股 ──
+    bar.progress(20, "正在下载行情数据…")
+
+    if is_in_window:
+        results, cache_time = screening_realtime(trade_date)
+    else:
+        results, cache_time = screening_review(trade_date)
+
+    bar.progress(95, "渲染结果…")
     time.sleep(0.2)
     bar.empty()
 
+    # ── 显示缓存信息 ──
+    st.info(
+        f"📦 使用缓存结果，上次更新时间：{cache_time.strftime('%H:%M:%S')}"
+    )
+
+    # ── 显示结果 ──
     if not results:
         st.info("📭 今日无符合条件标的，建议空仓休息 ☕")
     else:
