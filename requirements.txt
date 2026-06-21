@@ -2,3 +2,4 @@ streamlit
 pandas
 tushare
 matplotlib
+pytz
