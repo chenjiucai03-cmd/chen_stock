@@ -15,6 +15,7 @@ import streamlit as st
 import pandas as pd
 import tushare as ts
 import time
+import pytz
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="隔夜战法", layout="wide")
@@ -31,6 +32,35 @@ div[data-testid="stToolbar"] {display: none;}
 )
 
 st.title("📈 隔夜战法选股")
+
+
+# ═══════════════════════════════════════════════════════════
+#  时间锁 ── 仅允许尾盘 14:30 ~ 14:55 操作
+# ═══════════════════════════════════════════════════════════
+
+START_HOUR, START_MIN = 14, 30
+END_HOUR, END_MIN = 14, 55
+
+beijing_tz = pytz.timezone("Asia/Shanghai")
+now_bj = datetime.now(beijing_tz)
+current_code = now_bj.hour * 100 + now_bj.minute
+start_code = START_HOUR * 100 + START_MIN
+end_code = END_HOUR * 100 + END_MIN
+
+is_in_window = start_code <= current_code < end_code
+
+if is_in_window:
+    st.success(
+        f"✅ 当前有效选股时段（{START_HOUR:02d}:{START_MIN:02d}-"
+        f"{END_HOUR:02d}:{END_MIN:02d}），点击按钮开始筛选 "
+        f"🕐 服务器时间 {now_bj.strftime('%H:%M:%S')}"
+    )
+else:
+    st.warning(
+        f"⚠️ 当前非尾盘有效时段（{START_HOUR:02d}:{START_MIN:02d}-"
+        f"{END_HOUR:02d}:{END_MIN:02d}），数据无效，请勿操作！ "
+        f"🕐 服务器时间 {now_bj.strftime('%H:%M:%S')}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -133,7 +163,7 @@ def get_hist_bars(ts_code, start, end):
 #  主流程
 # ═══════════════════════════════════════════════════════════
 
-if st.button("🚀 一键选股", type="primary", use_container_width=True):
+if st.button("🚀 一键选股", type="primary", use_container_width=True, disabled=not is_in_window):
     bar = st.progress(0, "正在获取交易日信息…")
 
     # ── 确定交易日 ──
